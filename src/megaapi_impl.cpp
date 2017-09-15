@@ -2898,6 +2898,7 @@ const char *MegaRequestPrivate::getRequestString() const
         case TYPE_QUERY_TRANSFER_QUOTA: return "QUERY_TRANSFER_QUOTA";
         case TYPE_PASSWORD_LINK: return "PASSWORD_LINK";
         case TYPE_GET_ACHIEVEMENTS: return "GET_ACHIEVEMENTS";
+        case TYPE_RESTORE: return "RESTORE";
     }
     return "UNKNOWN";
 }
@@ -4804,11 +4805,23 @@ void MegaApiImpl::renameNode(MegaNode *node, const char *newName, MegaRequestLis
     waiter->notify();
 }
 
-void MegaApiImpl::remove(MegaNode *node, MegaRequestListener *listener)
+void MegaApiImpl::remove(MegaNode *node, bool keepversions, MegaRequestListener *listener)
 {
 	MegaRequestPrivate *request = new MegaRequestPrivate(MegaRequest::TYPE_REMOVE, listener);
     if(node) request->setNodeHandle(node->getHandle());
+    request->setFlag(keepversions);
 	requestQueue.push(request);
+    waiter->notify();
+}
+
+void MegaApiImpl::restoreVersion(MegaNode *version, MegaRequestListener *listener)
+{
+    MegaRequestPrivate *request = new MegaRequestPrivate(MegaRequest::TYPE_RESTORE, listener);
+    if (version)
+    {
+        request->setNodeHandle(version->getHandle());
+    }
+    requestQueue.push(request);
     waiter->notify();
 }
 
@@ -9596,7 +9609,7 @@ void MegaApiImpl::syncupdate_remote_file_addition(Sync *sync, Node *n)
 
 void MegaApiImpl::syncupdate_remote_file_deletion(Sync *sync, Node *n)
 {
-    LOG_debug << "Sync - remote file deletion detected " << n->displayname();
+    LOG_debug << "Sync - remote file deletion detected " << n->displayname() << " Nhandle: " << LOG_NODEHANDLE(n->nodehandle);
     client->abortbackoff(false);
 
     if(syncMap.find(sync->tag) == syncMap.end()) return;
@@ -9980,7 +9993,8 @@ void MegaApiImpl::putnodes_result(error e, targettype_t t, NewNode* nn)
     if(!request || ((request->getType() != MegaRequest::TYPE_IMPORT_LINK) &&
                     (request->getType() != MegaRequest::TYPE_CREATE_FOLDER) &&
                     (request->getType() != MegaRequest::TYPE_COPY) &&
-                    (request->getType() != MegaRequest::TYPE_MOVE))) return;
+                    (request->getType() != MegaRequest::TYPE_MOVE) &&
+                    (request->getType() != MegaRequest::TYPE_RESTORE))) return;
 
 #ifdef ENABLE_SYNC
     client->syncdownrequired = true;
@@ -12400,7 +12414,7 @@ int MegaApiImpl::getNumChildren(MegaNode* p)
 
 	sdkMutex.lock();
 	Node *parent = client->nodebyhandle(p->getHandle());
-	if (!parent)
+    if (!parent)// || parent->type == FILENODE)
 	{
 		sdkMutex.unlock();
 		return 0;
@@ -12418,7 +12432,7 @@ int MegaApiImpl::getNumChildFiles(MegaNode* p)
 
 	sdkMutex.lock();
 	Node *parent = client->nodebyhandle(p->getHandle());
-	if (!parent)
+    if (!parent)// || parent->type == FILENODE)
 	{
 		sdkMutex.unlock();
 		return 0;
@@ -12441,7 +12455,7 @@ int MegaApiImpl::getNumChildFolders(MegaNode* p)
 
 	sdkMutex.lock();
 	Node *parent = client->nodebyhandle(p->getHandle());
-	if (!parent)
+    if (!parent) //|| parent->type == FILENODE)
 	{
 		sdkMutex.unlock();
 		return 0;
@@ -12465,7 +12479,7 @@ MegaNodeList *MegaApiImpl::getChildren(MegaNode* p, int order)
 
     sdkMutex.lock();
     Node *parent = client->nodebyhandle(p->getHandle());
-	if(!parent)
+    if (!parent)// || parent->type == FILENODE)
 	{
         sdkMutex.unlock();
         return new MegaNodeListPrivate();
@@ -12510,16 +12524,50 @@ MegaNodeList *MegaApiImpl::getChildren(MegaNode* p, int order)
     else return new MegaNodeListPrivate();
 }
 
+MegaNodeList *MegaApiImpl::getVersions(MegaNode *node)
+{
+    if (!node)
+    {
+        return new MegaNodeListPrivate();
+    }
+
+    sdkMutex.lock();
+    Node *current = client->nodebyhandle(node->getHandle());
+    if (!current)
+    {
+        sdkMutex.unlock();
+        return new MegaNodeListPrivate();
+    }
+
+    vector<Node*> versions;
+    versions.push_back(current);
+    if (current->type != FILENODE)
+    {
+        sdkMutex.unlock();
+        return new MegaNodeListPrivate(versions.data(), versions.size());
+    }
+
+    while (current->children.size())
+    {
+        assert(current->children.size() == 1 && current->children.front()->parent == current);
+        current = current->children.front();
+        assert(current->type == FILENODE);
+        versions.push_back(current);
+    }
+    sdkMutex.unlock();
+    return new MegaNodeListPrivate(versions.data(), versions.size());
+}
+
 MegaChildrenLists *MegaApiImpl::getFileFolderChildren(MegaNode *p, int order)
 {
-    if(!p)
+    if (!p)
     {
         return new MegaChildrenListsPrivate();
     }
 
     sdkMutex.lock();
     Node *parent = client->nodebyhandle(p->getHandle());
-    if(!parent)
+    if (!parent)// || parent->type == FILENODE)
     {
         sdkMutex.unlock();
         return new MegaChildrenListsPrivate();
@@ -12610,7 +12658,13 @@ bool MegaApiImpl::hasChildren(MegaNode *parent)
 
     sdkMutex.lock();
     Node *p = client->nodebyhandle(parent->getHandle());
-    bool ret = p ? p->children.size() : false;
+    if (!p)// || p->type == FILENODE)
+    {
+        sdkMutex.unlock();
+        return false;
+    }
+
+    bool ret = p->children.size();
     sdkMutex.unlock();
 
     return ret;
@@ -12632,7 +12686,7 @@ int MegaApiImpl::getIndex(MegaNode *n, int order)
     }
 
     Node *parent = node->parent;
-    if(!parent)
+    if (!parent)
     {
         sdkMutex.unlock();
         return -1;
@@ -13835,6 +13889,54 @@ void MegaApiImpl::sendPendingRequests()
             }
 			break;
 		}
+        case MegaRequest::TYPE_RESTORE:
+        {
+            Node *version = client->nodebyhandle(request->getNodeHandle());
+            if (!version)
+            {
+                e = API_ENOENT;
+                break;
+            }
+
+            if (!version->parent && version->parent->type == FILENODE)
+            {
+                e = API_EARGS;
+            }
+
+            Node *current = version;
+            while (current->parent && current->parent->type == FILENODE)
+            {
+                current = current->parent;
+            }
+
+            if (!current->parent)
+            {
+                e = API_EINTERNAL;
+                break;
+            }
+
+            NewNode* newnode = new NewNode[1];
+            string attrstring;
+            SymmCipher key;
+
+            // set up new node as folder node
+            newnode->source = NEW_NODE;
+            newnode->type = FILENODE;
+            newnode->nodehandle = version->nodehandle;
+            newnode->parenthandle = UNDEF;
+            newnode->ovhandle = current->nodehandle;
+            newnode->nodekey = version->nodekey;
+            newnode->attrstring = new string();
+            if (newnode->nodekey.size())
+            {
+                key.setkey((const byte*)version->nodekey.data(), version->type);
+                version->attrs.getjson(&attrstring);
+                client->makeattr(&key, newnode->attrstring, attrstring.c_str());
+            }
+
+            client->putnodes(current->parent->nodehandle, newnode, 1);
+            break;
+        }
         case MegaRequest::TYPE_RENAME:
         {
             Node* node = client->nodebyhandle(request->getNodeHandle());
@@ -13852,10 +13954,17 @@ void MegaApiImpl::sendPendingRequests()
 		case MegaRequest::TYPE_REMOVE:
 		{
 			Node* node = client->nodebyhandle(request->getNodeHandle());
+            bool keepversions = request->getFlag();
 
             if (!node)
             {
                 e = API_ENOENT;
+                break;
+            }
+
+            if (keepversions && node->type != FILENODE)
+            {
+                e = API_EARGS;
                 break;
             }
 
@@ -13867,7 +13976,7 @@ void MegaApiImpl::sendPendingRequests()
                 break;
             }
 
-			e = client->unlink(node);
+            e = client->unlink(node, keepversions);
 			break;
 		}
 		case MegaRequest::TYPE_SHARE:
@@ -16004,7 +16113,7 @@ void TreeProcCopy::proc(MegaClient* client, Node* n)
 			t->nodekey.assign((char*)buf,FOLDERNODEKEYLENGTH);
 		}
 
-		t->attrstring = new string;
+        t->attrstring = new string();
 		if(t->nodekey.size())
 		{
 			key.setkey((const byte*)t->nodekey.data(),n->type);
